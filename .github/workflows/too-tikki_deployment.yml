@@ -1,0 +1,316 @@
+################################################################################
+# Workflow metadata and triggers
+################################################################################
+name: "Deployment Pipeline (too-tikki)"
+
+# woho this is new
+on:
+  push:
+    branches:
+      - "**"
+    paths:
+      - ".github/workflows/too-tikki_deployment.yml"
+      - "apps/too-tikki/**"
+  workflow_dispatch:
+    inputs:
+      artifact-tag:
+        type: string
+        description: "Optional tag of an artifact to deploy (e.g., `app-foo-20251010123456-000000-a1b2c3d4-main`)"
+        required: false
+      environment:
+        type: choice
+        description: "The environment(s) to deploy"
+        required: true
+        default: "-- All --"
+        options:
+          - "-- All --"
+          - "dev"
+          - "prod"
+      runner:
+        description: "The GitHub actions runner to use for building"
+        default: ubuntu-24.04
+        required: false
+        type: choice
+        options:
+          - ubuntu-24.04
+          - 8CoreBuilder
+          - 16CoreBuilder
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+################################################################################
+# Environment configuration
+################################################################################
+env:
+  APP_NAME: "too-tikki"
+  STACK_NAME: "app-too-tikki"
+  TARGET_REPOSITORY: "pirates-iac"
+  DD_TEAM: "utviklerflyt"
+
+jobs:
+  ################################################################################
+  # Job: Read config
+  ################################################################################
+  read-config:
+    name: Read config
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.config.outputs.result }}
+      app-name: ${{ steps.app-name.outputs.result }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Store app name as output
+        id: app-name
+        run: echo "result=$APP_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Store config as output
+        id: config
+        run: |
+          config="$(jq -e -c . ".gp.cicd.json")"
+          echo "  $config"
+          echo "result=$config" >> "$GITHUB_OUTPUT"
+
+      - name: Upload git metadata
+        env:
+          DD_API_KEY: ${{ secrets.SHARED_DATADOG_API_KEY }}
+          DD_SITE: "datadoghq.eu"
+        run: |
+          DATADOG_CI_VERSION="v5.5.0"
+          npx "@datadog/datadog-ci@$DATADOG_CI_VERSION" git-metadata upload
+
+  ################################################################################
+  # Job: Build and upload artifact!
+  ################################################################################
+  build-and-upload-artifact:
+    name: Build and upload artifact
+    if: ${{ github.event_name == 'push' || github.event.inputs.artifact-tag == '' }}
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-24.04' }}
+    needs:
+      - read-config
+    permissions:
+      contents: read
+      id-token: write
+      statuses: write
+    outputs:
+      tag: ${{ steps.upload.outputs.result }}
+    steps:
+      ################################################################################
+      # Build: Java compile and tests
+      ################################################################################
+      - name: Checkout code
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@4d9f0ba0025fe599b4ebab900eb7f3a1d93ef4c2 # v5.0.0
+        env:
+          GRADLE_ACTIONS_SKIP_BUILD_RESULT_CAPTURE: true
+        with:
+          add-job-summary: "on-failure"
+
+      - name: Build JAR
+        working-directory: apps/too-tikki
+        run: |
+          ./gradlew build -x test --no-daemon
+
+      - name: Test
+        working-directory: apps/too-tikki
+        run: ./gradlew test --no-daemon
+
+      ################################################################################
+      # Build: Container image
+      ################################################################################
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Build
+        id: docker-build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        env:
+          DOCKER_BUILD_SUMMARY: false
+        with:
+          push: false
+          load: true
+          context: apps/too-tikki
+          # https://docs.docker.com/build/ci/github-actions/examples/#cache
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      ################################################################################
+      # Publish: Tag and upload image artifact (ECR)
+      ################################################################################
+      - name: Generate tag
+        id: tag
+        uses: oslokommune/composite-actions/generate-tag@0efffd478b87121c8b8b20077138c540cffc0727  # v1.0.1
+        with:
+          identifier: ${{ env.APP_NAME }}
+
+        # Expects the Docker image to already be built and loaded into the local Docker engine image store.
+      - name: Package and upload artifact
+        id: upload
+        uses: oslokommune/composite-actions/package-and-upload-artifact@9ab947dff73fc20bc87fde3844b7523bec19a5f6 # package-and-upload-artifact-v1.1.0
+        with:
+          config: ${{ needs.read-config.outputs.result }}
+          tag: ${{ steps.tag.outputs.result }}
+          source-location: ${{ steps.docker-build.outputs.imageid }}
+          source-type: docker-image
+
+  ################################################################################
+  # Job: Deploy to dev
+  ################################################################################
+  deploy-dev:
+    name: Deploy to dev
+    needs:
+      - read-config
+      - build-and-upload-artifact
+    # Always run on push events, but conditionally run on workflow dispatch events
+    if: >-
+      ${{
+        always()
+        && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        && needs.read-config.result == 'success'
+        && contains(fromJSON('["success", "skipped"]'), needs.build-and-upload-artifact.result)
+        && (
+          github.event_name == 'push'
+          || contains(fromJSON('["-- All --", "dev"]'), github.event.inputs.environment)
+        )
+      }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      actions: write
+    concurrency:
+      group: ${{ fromJSON(needs.read-config.outputs.result).dev.name }}-${{ needs.read-config.outputs.app-name }}
+      cancel-in-progress: false
+    outputs:
+      terraform-outputs: ${{ steps.deploy.outputs.terraform-outputs }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Deploy
+        id: deploy
+        uses: oslokommune/composite-actions/terraform-deploy@223d2fb543b9edd1bbf6f9ca6d9d797bd57e82a3 # v1.6.0
+        with:
+          environment: "dev" # Must match value in .gp.cicd.json
+          target-repository: ${{ env.TARGET_REPOSITORY }}
+          stack-dir: "stacks/dev/${{ env.STACK_NAME }}"
+          config: ${{ needs.read-config.outputs.result }}
+          tag: ${{ needs.build-and-upload-artifact.outputs.tag || github.event.inputs.artifact-tag }}
+          github-app-id: ${{ secrets.SHARED_GH_APP_IAC_READ_APP_ID }}
+          github-app-private-key: ${{ secrets.SHARED_GH_APP_IAC_READ_PRIVATE_KEY }}
+          github-deploy-key: ${{ secrets.GOLDEN_PATH_IAC_PRIVATE_DEPLOY_KEY }}
+          datadog-api-key: ${{ secrets.SHARED_DATADOG_API_KEY }}
+
+  ################################################################################
+  # Job: Test dev deployment
+  ################################################################################
+  test-dev:
+    name: Test dev deployment
+    needs:
+      - read-config
+      - deploy-dev
+    if: >-
+      always()
+      && needs.deploy-dev.result == 'success'
+      && needs.read-config.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      SERVICE_URL: ${{ fromJSON(needs.deploy-dev.outputs.terraform-outputs).service_url }}
+      ENVIRONMENT: ${{ fromJSON(needs.read-config.outputs.result).dev.name }}
+    steps:
+      - name: Run tests
+        run: |
+          curl --silent --show-error --location --fail "$SERVICE_URL" > /dev/null
+
+  ################################################################################
+  # Job: Deploy to prod
+  ################################################################################
+  deploy-prod:
+    name: Deploy to prod
+    needs:
+      - read-config
+      - build-and-upload-artifact
+      - deploy-dev
+      - test-dev
+    # Always run on push events, but conditionally run on workflow dispatch events
+    if: >-
+      ${{
+        always()
+        && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        && needs.read-config.result == 'success'
+        && contains(fromJSON('["success", "skipped"]'), needs.build-and-upload-artifact.result)
+        && !contains(fromJSON('["failure", "cancelled"]'), needs.deploy-dev.result)
+        && !contains(fromJSON('["failure", "cancelled"]'), needs.test-dev.result)
+        && (
+          github.event_name == 'push'
+          || contains(fromJSON('["-- All --", "prod"]'), github.event.inputs.environment)
+        )
+      }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      actions: write
+    concurrency:
+      group: ${{ fromJSON(needs.read-config.outputs.result).prod.name }}-${{ needs.read-config.outputs.app-name }}
+      cancel-in-progress: false
+    environment:
+      name: ${{ fromJSON(needs.read-config.outputs.result).prod.name }}-${{ needs.read-config.outputs.app-name }}
+    outputs:
+      terraform-outputs: ${{ steps.deploy.outputs.terraform-outputs }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Deploy
+        id: deploy
+        uses: oslokommune/composite-actions/terraform-deploy@223d2fb543b9edd1bbf6f9ca6d9d797bd57e82a3 # v1.6.0
+        with:
+          environment: "prod"  # Must match value in .gp.cicd.json
+          target-repository: ${{ env.TARGET_REPOSITORY }}
+          stack-dir: "stacks/prod/${{ env.STACK_NAME }}"
+          config: ${{ needs.read-config.outputs.result }}
+          tag: ${{ needs.build-and-upload-artifact.outputs.tag || github.event.inputs.artifact-tag }}
+          github-app-id: ${{ secrets.SHARED_GH_APP_IAC_READ_APP_ID }}
+          github-app-private-key: ${{ secrets.SHARED_GH_APP_IAC_READ_PRIVATE_KEY }}
+          github-deploy-key: ${{ secrets.GOLDEN_PATH_IAC_PRIVATE_DEPLOY_KEY }}
+          datadog-api-key: ${{ secrets.SHARED_DATADOG_API_KEY }}
+
+  ################################################################################
+  # Job: Test prod deployment
+  ################################################################################
+  test-prod:
+    name: Test prod deployment
+    needs:
+      - read-config
+      - deploy-prod
+    if: >-
+      always()
+      && needs.read-config.result == 'success'
+      && needs.deploy-prod.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      SERVICE_URL: ${{ fromJSON(needs.deploy-prod.outputs.terraform-outputs).service_url }}
+      ENVIRONMENT: ${{ fromJSON(needs.read-config.outputs.result).prod.name }}
+    steps:
+      - name: Run tests
+        run: |
+          curl --silent --show-error --location --fail "$SERVICE_URL" > /dev/null
