@@ -3,7 +3,7 @@
 ################################################################################
 name: "Deployment Pipeline (too-tikki)"
 
-# woho this is new
+# We want to distribute this comment
 on:
   push:
     branches:
